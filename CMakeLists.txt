@@ -7,12 +7,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
     
 add_executable(ibl_convoluter src/Main.cpp
+                              src/Shader.cpp
+                              src/Shader.h
                               src/stb_image.h
                               src/stb_image.cpp
                               src/stb_image_write.h
                               src/stb_image_write.cpp
 )
 
+target_include_directories(ibl_convoluter PRIVATE include)
 
 if(MSVC)
   target_compile_options(ibl_convoluter PRIVATE /W4)

@@ -6,8 +6,9 @@
 #include <vector>
 #include <GLFW/glfw3.h>
 #include "ispc_texcomp.h"
+#include <cassert>
 
-void Convolute(const char* hdriPath, GLuint cubeVAO);
+void Convolute(const char* hdriPath, int resolution, float maxRadiance, GLuint cubeVAO);
 
 void GLAPIENTRY
 MessageCallback(GLenum source,
@@ -18,16 +19,17 @@ MessageCallback(GLenum source,
     const GLchar* message,
     const void* userParam);
 
+int BytesPerFaceBC6(std::uint32_t resolution, std::uint32_t mipmapLevels);
+
 struct CubemapFile
 {
-    static constexpr std::uint32_t correctMagicNumber = ' SDD';
+    static constexpr std::uint32_t correctMagicNumber = 'PMBC';
     struct Header
     {
         std::uint32_t magicNumber = correctMagicNumber;
         std::uint32_t mipmapLevels;
-        std::uint32_t width;
-        std::uint32_t height;
-        // TODO: specify pixel format
+        std::uint32_t resolution;
+        // TODO: specify pixel format?
     };
     Header header;
     std::vector<std::uint8_t> pixels;
@@ -48,9 +50,28 @@ struct Vec3
 
 int main(int argc, char** argv)
 {
-    if (argc < 2)
+    if (argc < 3)
     {
-        std::cout << "Usage: ibl_convoluter hdri1_path [hdri2_path] ... [hdri3_path]\n";
+        std::cout << "Usage: ibl_convoluter hdri1_path resolutionPixels [maxRadiance]\n";
+        return 0;
+    }
+
+    int resolution = std::atoi(argv[2]);
+    if (resolution <= 0)
+    {
+        std::cout << "Invalid resolution: '" << argv[2] << "'\n";
+        return 0;
+    }
+
+    float maxRadiance = 0.0f;
+    if (argc == 4)
+    {
+        maxRadiance = std::atof(argv[3]);
+        if (maxRadiance <= 0.0f)
+        {
+            std::cout << "Invalid max radiance: '" << argv[3] << "'\n";
+            return 0;
+        }
     }
 
     if (!glfwInit())
@@ -129,15 +150,12 @@ int main(int argc, char** argv)
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 2 * sizeof(Vec3), (const void*)(sizeof(Vec3)));
 
-    for (int i = 1; i < argc; i++)
-    {
-        Convolute(argv[i], cubeVAO);
-    }
+    Convolute(argv[1], resolution, maxRadiance, cubeVAO);
 
     return 0;
 }
 
-void Convolute(const char* hdriPath, GLuint cubeVAO)
+void Convolute(const char* hdriPath, int resolution, float maxRadiance, GLuint cubeVAO)
 {
     int width, height, nrComponents;
     stbi_set_flip_vertically_on_load(true);
@@ -145,9 +163,13 @@ void Convolute(const char* hdriPath, GLuint cubeVAO)
     GLuint hdrTexture;
     if (data)
     {
-        for (int i = 0; i < width * height * nrComponents; i++)
+        assert(nrComponents == 3);
+        if (maxRadiance > 0.0f)
         {
-            data[i] = std::clamp(data[i], 0.0f, 500.0f);
+            for (int i = 0; i < width * height; i++)
+            {
+                data[i] = std::clamp(data[i], 0.0f, maxRadiance);
+            }
         }
         glGenTextures(1, &hdrTexture);
         glBindTexture(GL_TEXTURE_2D, hdrTexture);
@@ -165,8 +187,6 @@ void Convolute(const char* hdriPath, GLuint cubeVAO)
         std::cout << "Failed to load HDR image at " << hdriPath << std::endl;
         return;
     }
-    // TODO: remove
-    width = 2048;
 
     GLuint environmentMap;
     glGenTextures(1, &environmentMap);
@@ -174,7 +194,7 @@ void Convolute(const char* hdriPath, GLuint cubeVAO)
     for (unsigned int i = 0; i < 6; ++i)
     {
         glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_RGBA16F,
-            width, width, 0, GL_RGBA, GL_FLOAT, nullptr);
+            resolution, resolution, 0, GL_RGBA, GL_FLOAT, nullptr);
     }
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -193,22 +213,52 @@ void Convolute(const char* hdriPath, GLuint cubeVAO)
     glBindTexture(GL_TEXTURE_2D, hdrTexture);
     equirectToCubemapShader.SetInt("equirectangularMap", 0);
 
-    glViewport(0, 0, width, width);
-
-    std::vector<std::uint8_t> pixels(width * width * 8);
-    CubemapFile envMapFile;
-    envMapFile.header.width = width;
-    envMapFile.header.height = width;
-    envMapFile.header.mipmapLevels = 1;
-    envMapFile.pixels.resize(envMapFile.header.width * envMapFile.header.height * 6, 255);
-
+    glViewport(0, 0, resolution, resolution);
     for (unsigned int i = 0; i < 6; ++i)
     {
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
             GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, environmentMap, 0);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, (const void*)(i * 6 * sizeof(GLuint)));
-        glReadPixels(0, 0, width, width, GL_RGBA, GL_HALF_FLOAT, pixels.data());
+    }
+
+     // TODO: look into compressonator mip map generation
+    glBindTexture(GL_TEXTURE_CUBE_MAP, environmentMap);
+    glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+
+    CubemapFile envMapFile;
+    envMapFile.header.resolution = resolution;
+    envMapFile.header.mipmapLevels = 1 + (int)std::log2(resolution);
+    int bytesPerFace = BytesPerFaceBC6(resolution, envMapFile.header.mipmapLevels);
+    envMapFile.pixels.resize(bytesPerFace * 6);
+
+    std::vector<std::uint8_t> uncompressedPixels(resolution * resolution * 8);
+
+    int faceOffsetBytes = 0;
+    for (unsigned int i = 0; i < 6; ++i)
+    {
+        int mipRes = envMapFile.header.resolution;
+        int mipLevelOffsetBytes = 0;
+        for (unsigned int j = 0; j < envMapFile.header.mipmapLevels; j++)
+        {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, environmentMap, j);
+            glReadPixels(0, 0, mipRes, mipRes, GL_RGBA, GL_HALF_FLOAT, uncompressedPixels.data());
+            rgba_surface surface;
+            surface.ptr = uncompressedPixels.data();
+            surface.width = mipRes;
+            surface.height = mipRes;
+            surface.stride = surface.width * 8;
+            bc6h_enc_settings settings;
+            GetProfile_bc6h_basic(&settings);
+            CompressBlocksBC6H(&surface, &envMapFile.pixels[faceOffsetBytes + mipLevelOffsetBytes], &settings);
+            mipLevelOffsetBytes += mipRes * mipRes;
+            mipRes = std::max(mipRes / 2, 4);
+        }
+        faceOffsetBytes += bytesPerFace;
+    }
+     
+    WriteCubemapFile(envMapFile, "envmap.cubemap");
         rgba_surface surface;
         surface.ptr = pixels.data();
         surface.width = width;
@@ -234,4 +284,17 @@ void GLAPIENTRY MessageCallback(GLenum source, GLenum type, GLuint id, GLenum se
             (type == GL_DEBUG_TYPE_ERROR ? "** GL ERROR **" : ""),
             type, severity, message);
     }
+}
+
+int BytesPerFaceBC6(std::uint32_t resolution, std::uint32_t mipmapLevels)
+{
+    int bytesNeeded = resolution * resolution;
+
+    for (int i = 1; i < mipmapLevels; i++)
+    {
+        resolution = std::max(resolution / 2, 4u); // BC6 always works with 4x4 blocks
+        bytesNeeded += resolution * resolution;
+    }
+
+    return bytesNeeded;
 }

@@ -19,7 +19,7 @@ MessageCallback(GLenum source,
     const GLchar* message,
     const void* userParam);
 
-int BytesPerFaceBC6(std::uint32_t resolution, std::uint32_t mipmapLevels);
+int TextureSizeBC6(std::uint32_t resolution, std::uint32_t mipmapLevels);
 
 struct CubemapFile
 {
@@ -102,7 +102,6 @@ int main(int argc, char** argv)
     glEnable(GL_DEBUG_OUTPUT);
     glDebugMessageCallback(MessageCallback, 0);
 
-    glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
     glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
@@ -193,6 +192,7 @@ void Convolute(const char* hdriPath, int resolution, float maxRadiance, GLuint c
     glBindTexture(GL_TEXTURE_CUBE_MAP, environmentMap);
     for (unsigned int i = 0; i < 6; ++i)
     {
+        // RGBA used because this is the format expected by the BC6 compressor being used (final result of BC6 compression doesn't include alpha)
         glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_RGBA16F,
             resolution, resolution, 0, GL_RGBA, GL_FLOAT, nullptr);
     }
@@ -218,7 +218,7 @@ void Convolute(const char* hdriPath, int resolution, float maxRadiance, GLuint c
     {
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
             GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, environmentMap, 0);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT);
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, (const void*)(i * 6 * sizeof(GLuint)));
     }
 
@@ -229,7 +229,7 @@ void Convolute(const char* hdriPath, int resolution, float maxRadiance, GLuint c
     CubemapFile envMapFile;
     envMapFile.header.resolution = resolution;
     envMapFile.header.mipmapLevels = 1 + (int)std::log2(resolution);
-    int bytesPerFace = BytesPerFaceBC6(resolution, envMapFile.header.mipmapLevels);
+    int bytesPerFace = TextureSizeBC6(resolution, envMapFile.header.mipmapLevels);
     envMapFile.pixels.resize(bytesPerFace * 6);
 
     std::vector<std::uint8_t> uncompressedPixels(resolution * resolution * 8);
@@ -258,22 +258,115 @@ void Convolute(const char* hdriPath, int resolution, float maxRadiance, GLuint c
         faceOffsetBytes += bytesPerFace;
     }
      
-    WriteCubemapFile(envMapFile, "envmap.cubemap");
+    WriteCubemapFile(envMapFile, "envmap.cbmp");
+
+    const int irradianceRes = 32;
+    GLuint irradianceMap;
+    glGenTextures(1, &irradianceMap);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, irradianceMap);
+    for (unsigned int i = 0; i < 6; ++i)
+    {
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_RGBA16F, irradianceRes, irradianceRes, 0,
+            GL_RGBA, GL_FLOAT, nullptr);
+    }
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, captureFBO);
+
+    Shader convolutionShader = Shader("Shaders/equirectToCubemap.vert", "Shaders/convolute.frag");
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, environmentMap);
+    convolutionShader.SetInt("environmentMap", 0);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, captureFBO);
+    glViewport(0, 0, irradianceRes, irradianceRes);
+    uncompressedPixels.resize(irradianceRes * irradianceRes * 8);
+    CubemapFile irradianceMapFileData;
+    irradianceMapFileData.header.resolution = irradianceRes;
+    irradianceMapFileData.header.mipmapLevels = 1;
+    irradianceMapFileData.pixels.resize(irradianceRes * irradianceRes * 6);
+    int byteOffset = 0;
+    for (unsigned int i = 0; i < 6; ++i)
+    {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, irradianceMap, 0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, (const void*)(i * 6 * sizeof(GLuint)));
+        glReadPixels(0, 0, irradianceRes, irradianceRes, GL_RGBA, GL_HALF_FLOAT, uncompressedPixels.data());
         rgba_surface surface;
-        surface.ptr = pixels.data();
-        surface.width = width;
-        surface.height = width;
+        surface.ptr = uncompressedPixels.data();
+        surface.width = irradianceRes;
+        surface.height = irradianceRes;
         surface.stride = surface.width * 8;
         bc6h_enc_settings settings;
         GetProfile_bc6h_basic(&settings);
-        CompressBlocksBC6H(&surface, &envMapFile.pixels[envMapFile.header.width * envMapFile.header.height * i], &settings);
+        CompressBlocksBC6H(&surface, &irradianceMapFileData.pixels[i * irradianceRes * irradianceRes], &settings);
+    }
+    
+    WriteCubemapFile(irradianceMapFileData, "irradiance.cbmp");
+
+    const int prefilterRes = 128;
+    GLuint prefilterMap;
+    glGenTextures(1, &prefilterMap);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, prefilterMap);
+    for (unsigned int i = 0; i < 6; ++i)
+    {
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_RGBA16F, prefilterRes, prefilterRes, 0, GL_RGBA, GL_FLOAT, nullptr);
+    }
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+
+    uncompressedPixels.resize(prefilterRes * prefilterRes * 8);
+    Shader prefilterShader = Shader("Shaders/equirectToCubemap.vert", "Shaders/prefilter.frag");
+    prefilterShader.use();
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, environmentMap);
+    prefilterShader.SetInt("environmentMap", 0);
+    prefilterShader.SetFloat("environmentMapResolution", resolution);
+    glBindFramebuffer(GL_FRAMEBUFFER, captureFBO);
+    const unsigned int mipLevels = 5;
+    CubemapFile prefilterFile;
+    prefilterFile.header.mipmapLevels = mipLevels;
+    prefilterFile.header.resolution = prefilterRes;
+    prefilterFile.pixels.resize(TextureSizeBC6(prefilterRes, mipLevels) * 6);
+
+    byteOffset = 0;
+    for (unsigned int i = 0; i < 6; ++i)
+    {
+        int mipRes = prefilterRes;
+        for (unsigned int j = 0; j < mipLevels; j++)
+        {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, prefilterMap, j);
+            glViewport(0, 0, mipRes, mipRes);
+            glClear(GL_COLOR_BUFFER_BIT);
+            float roughness = (float)j / (float)(mipLevels - 1);
+            prefilterShader.SetFloat("roughness", roughness);
+            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, (const void*)(i * 6 * sizeof(GLuint)));
+            glReadPixels(0, 0, mipRes, mipRes, GL_RGBA, GL_HALF_FLOAT, uncompressedPixels.data());
+            rgba_surface surface;
+            surface.ptr = uncompressedPixels.data();
+            surface.width = mipRes;
+            surface.height = mipRes;
+            surface.stride = surface.width * 8;
+            bc6h_enc_settings settings;
+            GetProfile_bc6h_basic(&settings);
+            CompressBlocksBC6H(&surface, &prefilterFile.pixels[byteOffset], &settings);
+            byteOffset += mipRes >= 4 ? mipRes * mipRes : 4 * 4;
+            mipRes /= 2;
+        }
     }
 
-    WriteCubemapFile(envMapFile, "envmap.cubemap");
-
-    // TODO: look into compressonator mip map generation
-    // glBindTexture(GL_TEXTURE_CUBE_MAP, environmentMap);
-    // glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+    WriteCubemapFile(prefilterFile, "prefilter.cbmp");
 }
 
 void GLAPIENTRY MessageCallback(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* message, const void* userParam)
@@ -286,7 +379,7 @@ void GLAPIENTRY MessageCallback(GLenum source, GLenum type, GLuint id, GLenum se
     }
 }
 
-int BytesPerFaceBC6(std::uint32_t resolution, std::uint32_t mipmapLevels)
+int TextureSizeBC6(std::uint32_t resolution, std::uint32_t mipmapLevels)
 {
     int bytesNeeded = resolution * resolution;
 

@@ -18,6 +18,7 @@ public:
 	void use();
 
 	void SetInt(const char* name, int value);
+	void SetFloat(const char* name, float value);
 private:
 	std::string get_file_contents(const char* path);
 	std::unordered_map<std::string, int> cachedUniformLocations;
